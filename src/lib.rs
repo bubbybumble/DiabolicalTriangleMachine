@@ -27,6 +27,8 @@ struct DiabolicalTriangleMachine {
     /// The next internal voice ID, used only to figure out the oldest voice for voice stealing.
     /// This is incremented by one each time a voice is created.
     next_internal_voice_id: u64,
+
+    sustain_pedal_held: bool,
 }
 
 #[derive(Params)]
@@ -61,6 +63,8 @@ struct Voice {
     /// The square root of the note's velocity. This is used as a gain multiplier.
     velocity_sqrt: f32,
 
+    // below, a note may only turn off if it is not held or sustained (sustain being pedal impl)
+    physically_held: bool,
     /// The voice's current phase. This is randomized at the start of the voice
     phase: f32,
     /// The phase increment. This is based on the voice's frequency, derived from the note index.
@@ -87,6 +91,7 @@ impl Default for DiabolicalTriangleMachine {
             // `[None; N]` requires the `Some(T)` to be `Copy`able
             voices: [0; NUM_VOICES as usize].map(|_| None),
             next_internal_voice_id: 0,
+            sustain_pedal_held: false,
         }
     }
 }
@@ -155,7 +160,7 @@ impl Plugin for DiabolicalTriangleMachine {
     }];
 
     // We won't need any MIDI CCs here, we just want notes and polyphonic modulation
-    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+    const MIDI_INPUT: MidiConfig = MidiConfig::MidiCCs;
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
     type SysExMessage = ();
@@ -209,6 +214,23 @@ impl Plugin for DiabolicalTriangleMachine {
                         // This synth doesn't support any of the polyphonic expression events. A
                         // real synth plugin however will want to support those.
                         match event {
+                            NoteEvent::MidiCC {
+                                timing,
+                                channel,
+                                cc,
+                                value,
+                            } => {
+                                nih_dbg!("CC: {} Value: {}", cc, value);
+                                if cc == 64 {
+                                    if value >= 0.5 {
+                                        // pedal on
+                                        self.sustain_pedal_held = true;
+                                    } else {
+                                        self.sustain_pedal_held = false;
+                                        self.find_and_stop_unheld_voices(sample_rate);
+                                    }
+                                }
+                            }
                             NoteEvent::NoteOn {
                                 timing,
                                 voice_id,
@@ -238,7 +260,9 @@ impl Plugin for DiabolicalTriangleMachine {
                                 note,
                                 velocity: _,
                             } => {
-                                self.start_release_for_voices(sample_rate, voice_id, channel, note)
+                                // self.start_release_for_voices(sample_rate, voice_id, channel, note)
+                                self.set_voice_not_held(sample_rate, voice_id, channel, note);
+                                // this should automatically handle release if there's no pedal
                             }
                             NoteEvent::Choke {
                                 timing,
@@ -401,7 +425,6 @@ impl Plugin for DiabolicalTriangleMachine {
                     if voice.phase >= 1.0 {
                         voice.phase -= 1.0;
                     }
-
                     output[0][sample_idx] += sample;
                     output[1][sample_idx] += sample;
                 }
@@ -460,7 +483,7 @@ impl DiabolicalTriangleMachine {
             channel,
             note,
             velocity_sqrt: 1.0,
-
+            physically_held: true,
             phase: 0.0,
             phase_delta: 0.0,
             releasing: false,
@@ -505,36 +528,82 @@ impl DiabolicalTriangleMachine {
             }
         }
     }
+    fn find_and_stop_unheld_voices(&mut self, sample_rate: f32) {
+        for voice in self.voices.iter_mut() {
+            match voice {
+                Some(Voice {
+                    physically_held,
+                    releasing,
+                    amp_envelope,
+                    ..  // ignore fields you don't need
+                }) if !*physically_held && !*releasing => {
+                    *releasing = true;
+                    amp_envelope.style = SmoothingStyle::Exponential(
+                        self.params.amp_release_ms.value()
+                    );
+                    amp_envelope.set_target(sample_rate, 0.0);
+                }
+                _ => (),
+            }
+        }
+    }
+    // fn find_and_stop_unheld_voices(&mut self, sample_rate: f32, channel: u8) {
+    //     for voice in self.voices.iter_mut() {
+    //         match voice {
+    //             Some(Voice {
+    //                 voice_id: candidate_voice_id,
+    //                 channel: candidate_channel,
+    //                 note: candidate_note,
+    //                 internal_voice_id,
+    //                 velocity_sqrt,
+    //                 physically_held,
+    //                 phase,
+    //                 phase_delta,
+    //                 releasing,
+    //                 amp_envelope,
+    //                 voice_gain,
+    //             }) if !*physically_held && !*releasing => {
+    //                 self.set_voice_not_held(
+    //                     sample_rate,
+    //                     Some(*candidate_voice_id),
+    //                     channel,
+    //                     *candidate_note,
+    //                 );
+    //             }
+    //             _ => (),
+    //         }
+    //     }
+    // }
 
-    /// Start the release process for one or more voice by changing their amplitude envelope. If
-    /// `voice_id` is not provided, then this will terminate all matching voices.
-    fn start_release_for_voices(
+    /// Set a note as not held for a voice; releases the voice if the sustain pedal is not held.
+    fn set_voice_not_held(
         &mut self,
         sample_rate: f32,
         voice_id: Option<i32>,
         channel: u8,
         note: u8,
     ) {
+        let currently_sustained = self.sustain_pedal_held;
         for voice in self.voices.iter_mut() {
             match voice {
                 Some(Voice {
                     voice_id: candidate_voice_id,
                     channel: candidate_channel,
                     note: candidate_note,
+                    physically_held,
                     releasing,
                     amp_envelope,
                     ..
                 }) if voice_id == Some(*candidate_voice_id)
                     || (channel == *candidate_channel && note == *candidate_note) =>
                 {
-                    *releasing = true;
-                    amp_envelope.style =
-                        SmoothingStyle::Exponential(self.params.amp_release_ms.value());
-                    amp_envelope.set_target(sample_rate, 0.0);
-
-                    // If this targetted a single voice ID, we're done here. Otherwise there may be
-                    // multiple overlapping voices as we enabled support for that in the
-                    // `PolyModulationConfig`.
+                    *physically_held = false;
+                    if !currently_sustained {
+                        *releasing = true;
+                        amp_envelope.style =
+                            SmoothingStyle::Exponential(self.params.amp_release_ms.value());
+                        amp_envelope.set_target(sample_rate, 0.0);
+                    }
                     if voice_id.is_some() {
                         return;
                     }
@@ -543,6 +612,43 @@ impl DiabolicalTriangleMachine {
             }
         }
     }
+    /// Start the release process for one or more voice by changing their amplitude envelope. If
+    /// `voice_id` is not provided, then this will terminate all matching voices.
+    // fn start_release_for_voices(
+    //     &mut self,
+    //     sample_rate: f32,
+    //     voice_id: Option<i32>,
+    //     channel: u8,
+    //     note: u8,
+    // ) {
+    //     for voice in self.voices.iter_mut() {
+    //         match voice {
+    //             Some(Voice {
+    //                 voice_id: candidate_voice_id,
+    //                 channel: candidate_channel,
+    //                 note: candidate_note,
+    //                 releasing,
+    //                 amp_envelope,
+    //                 ..
+    //             }) if voice_id == Some(*candidate_voice_id)
+    //                 || (channel == *candidate_channel && note == *candidate_note) =>
+    //             {
+    //                 *releasing = true;
+    //                 amp_envelope.style =
+    //                     SmoothingStyle::Exponential(self.params.amp_release_ms.value());
+    //                 amp_envelope.set_target(sample_rate, 0.0);
+    //
+    //                 // If this targetted a single voice ID, we're done here. Otherwise there may be
+    //                 // multiple overlapping voices as we enabled support for that in the
+    //                 // `PolyModulationConfig`.
+    //                 if voice_id.is_some() {
+    //                     return;
+    //                 }
+    //             }
+    //             _ => (),
+    //         }
+    //     }
+    // }
 
     /// Immediately terminate one or more voice, removing it from the pool and informing the host
     /// that the voice has ended. If `voice_id` is not provided, then this will terminate all
@@ -591,7 +697,7 @@ const fn compute_fallback_voice_id(note: u8, channel: u8) -> i32 {
 }
 
 impl ClapPlugin for DiabolicalTriangleMachine {
-    const CLAP_ID: &'static str = "com.moist-plugins-gmbh.poly-mod-synth";
+    const CLAP_ID: &'static str = "com.setscet.diabolicaltrianglemachine";
     const CLAP_DESCRIPTION: Option<&'static str> =
         Some("A simple polyphonic synthesizer with support for polyphonic modulation");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
@@ -616,7 +722,7 @@ impl ClapPlugin for DiabolicalTriangleMachine {
 // The VST3 verison of this plugin isn't too interesting as it will not support polyphonic
 // modulation
 impl Vst3Plugin for DiabolicalTriangleMachine {
-    const VST3_CLASS_ID: [u8; 16] = *b"PolyM0dSynth1337";
+    const VST3_CLASS_ID: [u8; 16] = *b"DTriangleMachine";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
         Vst3SubCategory::Instrument,
         Vst3SubCategory::Synth,
