@@ -227,7 +227,7 @@ impl Plugin for DiabolicalTriangleMachine {
                                         self.sustain_pedal_held = true;
                                     } else {
                                         self.sustain_pedal_held = false;
-                                        self.find_and_stop_unheld_voices(sample_rate);
+                                        self.find_and_stop_unheld_voices(sample_rate, channel);
                                     }
                                 }
                             }
@@ -238,20 +238,23 @@ impl Plugin for DiabolicalTriangleMachine {
                                 note,
                                 velocity,
                             } => {
-                                let initial_phase: f32 = self.prng.gen();
-                                // This starts with the attack portion of the amplitude envelope
-                                let amp_envelope = Smoother::new(SmoothingStyle::Exponential(
-                                    self.params.amp_attack_ms.value(),
-                                ));
-                                amp_envelope.reset(0.0);
-                                amp_envelope.set_target(sample_rate, 1.0);
+                                if !self.find_voice_and_mark_as_held(context, timing, channel, note)
+                                {
+                                    let initial_phase: f32 = self.prng.gen();
+                                    // This starts with the attack portion of the amplitude envelope
+                                    let amp_envelope = Smoother::new(SmoothingStyle::Exponential(
+                                        self.params.amp_attack_ms.value(),
+                                    ));
+                                    amp_envelope.reset(0.0);
+                                    amp_envelope.set_target(sample_rate, 1.0);
 
-                                let voice =
-                                    self.start_voice(context, timing, voice_id, channel, note);
-                                voice.velocity_sqrt = velocity.sqrt();
-                                voice.phase = initial_phase;
-                                voice.phase_delta = util::midi_note_to_freq(note) / sample_rate;
-                                voice.amp_envelope = amp_envelope;
+                                    let voice =
+                                        self.start_voice(context, timing, voice_id, channel, note);
+                                    voice.velocity_sqrt = velocity.sqrt();
+                                    voice.phase = initial_phase;
+                                    voice.phase_delta = util::midi_note_to_freq(note) / sample_rate;
+                                    voice.amp_envelope = amp_envelope;
+                                }
                             }
                             NoteEvent::NoteOff {
                                 timing: _,
@@ -528,15 +531,55 @@ impl DiabolicalTriangleMachine {
             }
         }
     }
-    fn find_and_stop_unheld_voices(&mut self, sample_rate: f32) {
+
+    fn find_voice_and_mark_as_held(
+        &mut self,
+        // sample_rate: f32,
+        // voice_id: Option<i32>,
+        context: &mut impl ProcessContext<Self>,
+        sample_offset: u32,
+        channel: u8,
+        note: u8,
+    ) -> bool {
+        // check to see if existing voice
+        let mut id_to_choke: Option<i32> = None;
+        for voice in self.voices.iter_mut() {
+            match voice {
+                Some(Voice {
+                    voice_id: candidate_voice_id,
+                    channel: candidate_channel,
+                    note: candidate_note,
+                    physically_held,
+                    releasing,
+                    amp_envelope,
+                    ..
+                }) if channel == *candidate_channel && note == *candidate_note => {
+                    if *releasing {
+                        id_to_choke = Some(*candidate_voice_id);
+                        break;
+                    }
+                    *physically_held = true;
+                    return true;
+                }
+                _ => (),
+            }
+        }
+        if id_to_choke.is_some() {
+            self.choke_voices(context, sample_offset, id_to_choke, channel, note);
+        }
+        return false;
+    }
+
+    fn find_and_stop_unheld_voices(&mut self, sample_rate: f32, channel: u8) {
         for voice in self.voices.iter_mut() {
             match voice {
                 Some(Voice {
                     physically_held,
                     releasing,
                     amp_envelope,
+                    channel: voice_channel,
                     ..  // ignore fields you don't need
-                }) if !*physically_held && !*releasing => {
+                }) if !*physically_held && !*releasing && channel == *voice_channel => {
                     *releasing = true;
                     amp_envelope.style = SmoothingStyle::Exponential(
                         self.params.amp_release_ms.value()
