@@ -42,6 +42,11 @@ struct DiabolicalTriangleMachineParams {
     /// The amplitude envelope release time. This is the same for every voice.
     #[id = "amp_rel"]
     amp_release_ms: FloatParam,
+
+    #[id = "initial_pitch_offset"]
+    initial_pitch_offset: FloatParam,
+    #[id = "pitch_correction_ms"]
+    pitch_correction_ms: FloatParam,
 }
 
 /// Data for a single synth voice. In a real synth where performance matter, you may want to use a
@@ -76,6 +81,8 @@ struct Voice {
     releasing: bool,
     /// Fades between 0 and 1 with timings based on the global attack and release settings.
     amp_envelope: Smoother<f32>,
+
+    pitch_offset: f32, // used for this plugins gimmick
 
     /// If this voice has polyphonic gain modulation applied, then this contains the normalized
     /// offset and a smoother.
@@ -136,6 +143,28 @@ impl Default for DiabolicalTriangleMachineParams {
                 FloatRange::Skewed {
                     min: 0.0,
                     max: 2000.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_step_size(0.1)
+            .with_unit(" ms"),
+
+            initial_pitch_offset: FloatParam::new(
+                "Initial Pitch Offset",
+                11.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 24.0,
+                },
+            )
+            .with_step_size(0.1)
+            .with_unit(" semitones"),
+            pitch_correction_ms: FloatParam::new(
+                "Pitch Correction",
+                1000.0,
+                FloatRange::Skewed {
+                    min: 0.0,
+                    max: 10000.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             )
@@ -220,8 +249,9 @@ impl Plugin for DiabolicalTriangleMachine {
                                 cc,
                                 value,
                             } => {
-                                nih_dbg!("CC: {} Value: {}", cc, value);
+                                // nih_dbg!("CC: {} Value: {}", cc, value);
                                 if cc == 64 {
+                                    // PEDAL
                                     if value >= 0.5 {
                                         // pedal on
                                         self.sustain_pedal_held = true;
@@ -241,6 +271,9 @@ impl Plugin for DiabolicalTriangleMachine {
                                 if !self.find_voice_and_mark_as_held(context, timing, channel, note)
                                 {
                                     let initial_phase: f32 = self.prng.gen();
+                                    let initial_pitch_offset: f32 = (self.prng.gen::<f32>() * 2.0
+                                        - 1.0)
+                                        * self.params.initial_pitch_offset.value();
                                     // This starts with the attack portion of the amplitude envelope
                                     let amp_envelope = Smoother::new(SmoothingStyle::Exponential(
                                         self.params.amp_attack_ms.value(),
@@ -254,6 +287,7 @@ impl Plugin for DiabolicalTriangleMachine {
                                     voice.phase = initial_phase;
                                     voice.phase_delta = util::midi_note_to_freq(note) / sample_rate;
                                     voice.amp_envelope = amp_envelope;
+                                    voice.pitch_offset = initial_pitch_offset;
                                 }
                             }
                             NoteEvent::NoteOff {
@@ -424,12 +458,18 @@ impl Plugin for DiabolicalTriangleMachine {
                     // let sample = (voice.phase * 2.0 - 1.0) * amp;
                     // above is old sawtooth, below is triangle wave
                     let sample = (((voice.phase * 2.0 - 1.0).abs() * 2.0) - 1.0) * amp;
-                    voice.phase += voice.phase_delta;
+
+                    let pitch_ratio = 2.0_f32.powf(voice.pitch_offset / 12.0);
+
+                    voice.phase += voice.phase_delta * pitch_ratio;
                     if voice.phase >= 1.0 {
                         voice.phase -= 1.0;
                     }
+                    let decay_seconds: f32 = self.params.pitch_correction_ms.value() / 1000.0;
                     output[0][sample_idx] += sample;
                     output[1][sample_idx] += sample;
+                    let decay_coeff = (-1.0 / (decay_seconds * sample_rate)).exp();
+                    voice.pitch_offset *= decay_coeff;
                 }
             }
 
@@ -491,6 +531,8 @@ impl DiabolicalTriangleMachine {
             phase_delta: 0.0,
             releasing: false,
             amp_envelope: Smoother::none(),
+
+            pitch_offset: 0.0,
 
             voice_gain: None,
         };
@@ -590,33 +632,6 @@ impl DiabolicalTriangleMachine {
             }
         }
     }
-    // fn find_and_stop_unheld_voices(&mut self, sample_rate: f32, channel: u8) {
-    //     for voice in self.voices.iter_mut() {
-    //         match voice {
-    //             Some(Voice {
-    //                 voice_id: candidate_voice_id,
-    //                 channel: candidate_channel,
-    //                 note: candidate_note,
-    //                 internal_voice_id,
-    //                 velocity_sqrt,
-    //                 physically_held,
-    //                 phase,
-    //                 phase_delta,
-    //                 releasing,
-    //                 amp_envelope,
-    //                 voice_gain,
-    //             }) if !*physically_held && !*releasing => {
-    //                 self.set_voice_not_held(
-    //                     sample_rate,
-    //                     Some(*candidate_voice_id),
-    //                     channel,
-    //                     *candidate_note,
-    //                 );
-    //             }
-    //             _ => (),
-    //         }
-    //     }
-    // }
 
     /// Set a note as not held for a voice; releases the voice if the sustain pedal is not held.
     fn set_voice_not_held(
@@ -655,43 +670,6 @@ impl DiabolicalTriangleMachine {
             }
         }
     }
-    /// Start the release process for one or more voice by changing their amplitude envelope. If
-    /// `voice_id` is not provided, then this will terminate all matching voices.
-    // fn start_release_for_voices(
-    //     &mut self,
-    //     sample_rate: f32,
-    //     voice_id: Option<i32>,
-    //     channel: u8,
-    //     note: u8,
-    // ) {
-    //     for voice in self.voices.iter_mut() {
-    //         match voice {
-    //             Some(Voice {
-    //                 voice_id: candidate_voice_id,
-    //                 channel: candidate_channel,
-    //                 note: candidate_note,
-    //                 releasing,
-    //                 amp_envelope,
-    //                 ..
-    //             }) if voice_id == Some(*candidate_voice_id)
-    //                 || (channel == *candidate_channel && note == *candidate_note) =>
-    //             {
-    //                 *releasing = true;
-    //                 amp_envelope.style =
-    //                     SmoothingStyle::Exponential(self.params.amp_release_ms.value());
-    //                 amp_envelope.set_target(sample_rate, 0.0);
-    //
-    //                 // If this targetted a single voice ID, we're done here. Otherwise there may be
-    //                 // multiple overlapping voices as we enabled support for that in the
-    //                 // `PolyModulationConfig`.
-    //                 if voice_id.is_some() {
-    //                     return;
-    //                 }
-    //             }
-    //             _ => (),
-    //         }
-    //     }
-    // }
 
     /// Immediately terminate one or more voice, removing it from the pool and informing the host
     /// that the voice has ended. If `voice_id` is not provided, then this will terminate all
