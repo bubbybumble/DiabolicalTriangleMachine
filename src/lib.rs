@@ -47,6 +47,26 @@ struct DiabolicalTriangleMachineParams {
     initial_pitch_offset: FloatParam,
     #[id = "pitch_correction_ms"]
     pitch_correction_ms: FloatParam,
+
+    // DRAWBARS for organ-like behavior
+    #[id = "drawbar1"]
+    drawbar1: FloatParam,
+    #[id = "drawbar2"]
+    drawbar2: FloatParam,
+    #[id = "drawbar3"]
+    drawbar3: FloatParam,
+    #[id = "drawbar4"]
+    drawbar4: FloatParam,
+    #[id = "drawbar5"]
+    drawbar5: FloatParam,
+    #[id = "drawbar6"]
+    drawbar6: FloatParam,
+    #[id = "drawbar7"]
+    drawbar7: FloatParam,
+    #[id = "drawbar8"]
+    drawbar8: FloatParam,
+    #[id = "drawbar9"]
+    drawbar9: FloatParam,
 }
 
 /// Data for a single synth voice. In a real synth where performance matter, you may want to use a
@@ -151,7 +171,7 @@ impl Default for DiabolicalTriangleMachineParams {
 
             initial_pitch_offset: FloatParam::new(
                 "Initial Pitch Offset",
-                11.0,
+                0.0,
                 FloatRange::Linear {
                     min: 0.0,
                     max: 24.0,
@@ -161,15 +181,54 @@ impl Default for DiabolicalTriangleMachineParams {
             .with_unit(" semitones"),
             pitch_correction_ms: FloatParam::new(
                 "Pitch Correction",
-                1000.0,
+                500.0,
                 FloatRange::Skewed {
                     min: 0.0,
-                    max: 10000.0,
+                    max: 5000.0,
                     factor: FloatRange::skew_factor(-1.0),
                 },
             )
             .with_step_size(0.1)
             .with_unit(" ms"),
+
+            drawbar1: FloatParam::new(
+                "16' Drawbar",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_step_size(0.1),
+            drawbar2: FloatParam::new(
+                "5 1/3' Drawbar",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_step_size(0.1),
+            drawbar3: FloatParam::new("8' Drawbar", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_step_size(0.1),
+            drawbar4: FloatParam::new("4' Drawbar", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_step_size(0.1),
+            drawbar5: FloatParam::new(
+                "2 2/3' Drawbar",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_step_size(0.1),
+            drawbar6: FloatParam::new("2' Drawbar", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_step_size(0.1),
+            drawbar7: FloatParam::new(
+                "1 3/5' Drawbar",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_step_size(0.1),
+            drawbar8: FloatParam::new(
+                "1 1/3' Drawbar",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_step_size(0.1),
+            drawbar9: FloatParam::new("1' Drawbar", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_step_size(0.1),
         }
     }
 }
@@ -244,7 +303,7 @@ impl Plugin for DiabolicalTriangleMachine {
                         // real synth plugin however will want to support those.
                         match event {
                             NoteEvent::MidiCC {
-                                timing,
+                                timing: _,
                                 channel,
                                 cc,
                                 value,
@@ -455,15 +514,36 @@ impl Plugin for DiabolicalTriangleMachine {
                 for (value_idx, sample_idx) in (block_start..block_end).enumerate() {
                     let amp = voice.velocity_sqrt * gain[value_idx] * voice_amp_envelope[value_idx];
 
-                    // let sample = (voice.phase * 2.0 - 1.0) * amp;
-                    // above is old sawtooth, below is triangle wave
-                    let sample = (((voice.phase * 2.0 - 1.0).abs() * 2.0) - 1.0) * amp;
+                    let hammond_harmonics: [f32; 9] = [0.5, 1.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0];
+                    let drawbar_levels = [
+                        self.params.drawbar1.value(),
+                        self.params.drawbar2.value(),
+                        self.params.drawbar3.value(),
+                        self.params.drawbar4.value(),
+                        self.params.drawbar5.value(),
+                        self.params.drawbar6.value(),
+                        self.params.drawbar7.value(),
+                        self.params.drawbar8.value(),
+                        self.params.drawbar9.value(),
+                        // ... etc
+                    ];
+
+                    let mut sample = 0.0_f32; // (((voice.phase * 2.1 - 1.0).abs() * 2.0) - 1.0) * amp;
+
+                    for i in 0..9 {
+                        let level = drawbar_levels[i];
+                        if level > 0.0 {
+                            let harmonic_phase = (voice.phase * hammond_harmonics[i]).fract();
+                            sample +=
+                                (((harmonic_phase * 2.0 - 1.0).abs() * 2.0) - 1.0) * level * amp;
+                        }
+                    }
 
                     let pitch_ratio = 2.0_f32.powf(voice.pitch_offset / 12.0);
 
                     voice.phase += voice.phase_delta * pitch_ratio;
-                    if voice.phase >= 1.0 {
-                        voice.phase -= 1.0;
+                    if voice.phase >= 256.0 {
+                        voice.phase -= 256.0;
                     }
                     let decay_seconds: f32 = self.params.pitch_correction_ms.value() / 1000.0;
                     output[0][sample_idx] += sample;
